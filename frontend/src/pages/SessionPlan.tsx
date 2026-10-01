@@ -1,4 +1,4 @@
-/** /sessions 场次安排与参与乐手：按日期/棚号排期并提示时段冲突 */
+/** /sessions 场次安排与参与乐手：按日期/棚号排期并提示时段冲突，支持离线包按稳定编号合并 */
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import {
@@ -15,14 +15,18 @@ import {
   Tag,
   message
 } from 'antd';
-import { PlusOutlined } from '@ant-design/icons';
+import { PlusOutlined, ImportOutlined } from '@ant-design/icons';
 import FilterBar from '@/components/common/FilterBar';
 import StatBadge from '@/components/common/StatBadge';
 import EmptyPanel from '@/components/common/EmptyPanel';
+import OfflineImportModal from '@/components/offline/OfflineImportModal';
+import PendingPanel from '@/components/offline/PendingPanel';
+import WaitlistPanel from '@/components/offline/WaitlistPanel';
 import { useIdbTable } from '@/hooks/useIdbTable';
 import { useSessionStore } from '@/stores/sessionStore';
 import { useProjectStore } from '@/stores/projectStore';
-import { db, type ProjectRow, type SessionRow, type SongRow, type TakeRow } from '@/utils/db';
+import { useOfflineStore } from '@/stores/offlineStore';
+import { db, type PendingSessionRow, type ProjectRow, type SessionRow, type SongRow, type TakeRow } from '@/utils/db';
 import {
   SESSION_PERIODS,
   SESSION_STATES,
@@ -41,6 +45,7 @@ export default function SessionPlan() {
   const songs = useIdbTable<SongRow>(db.songs);
   const projects = useIdbTable<ProjectRow>(db.projects);
   const takes = useIdbTable<TakeRow>(db.takes);
+  const pendings = useIdbTable<PendingSessionRow>(db.pendingSessions);
 
   const filters = useSessionStore((state) => state.filters);
   const setFilters = useSessionStore((state) => state.setFilters);
@@ -51,8 +56,12 @@ export default function SessionPlan() {
   const editSession = useSessionStore((state) => state.editSession);
   const deleteSession = useSessionStore((state) => state.deleteSession);
   const currentProjectId = useProjectStore((state) => state.currentProjectId);
+  const resumableDraftId = useOfflineStore((state) => state.resumableDraftId);
+  const refreshResumable = useOfflineStore((state) => state.refreshResumable);
+  const resumeDraft = useOfflineStore((state) => state.resumeDraft);
 
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
   const [editing, setEditing] = useState<SessionRow | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [form] = Form.useForm<Omit<Session, 'id'>>();
@@ -62,17 +71,31 @@ export default function SessionPlan() {
       keyword: searchParams.get('keyword') ?? '',
       rooms: searchParams.get('rooms') ? (searchParams.get('rooms') as string).split(',') : [],
       periods: searchParams.get('periods') ? (searchParams.get('periods') as string).split(',') : [],
-      states: searchParams.get('states') ? (searchParams.get('states') as string).split(',') : []
+      states: searchParams.get('states') ? (searchParams.get('states') as string).split(',') : [],
+      source: searchParams.get('source') ? (searchParams.get('source') as string).split(',') : []
     });
     // 仅首次挂载还原 URL 筛选
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // 挂载时检测可续跑的导入草稿（保住进度，接着处理）
+  useEffect(() => {
+    void refreshResumable();
+  }, [refreshResumable]);
+
   const selects: FilterSelectConfig[] = useMemo(
     () => [
       { key: 'rooms', label: '棚号', options: STUDIO_ROOMS.map((item) => ({ label: item, value: item })) },
       { key: 'periods', label: '时段', options: SESSION_PERIODS.map((item) => ({ label: item, value: item })) },
-      { key: 'states', label: '状态', options: SESSION_STATES.map((item) => ({ label: item, value: item })) }
+      { key: 'states', label: '状态', options: SESSION_STATES.map((item) => ({ label: item, value: item })) },
+      {
+        key: 'source',
+        label: '来源',
+        options: [
+          { label: '本地', value: '本地' },
+          { label: '离线包', value: '离线包' }
+        ]
+      }
     ],
     []
   );
@@ -84,6 +107,7 @@ export default function SessionPlan() {
     asArray(next.rooms).length > 0 && (params.rooms = asArray(next.rooms).join(','));
     asArray(next.periods).length > 0 && (params.periods = asArray(next.periods).join(','));
     asArray(next.states).length > 0 && (params.states = asArray(next.states).join(','));
+    asArray(next.source).length > 0 && (params.source = asArray(next.source).join(','));
     setSearchParams(params, { replace: true });
   }
 
@@ -99,13 +123,17 @@ export default function SessionPlan() {
     const rooms = asArray(filters.rooms);
     const periods = asArray(filters.periods);
     const states = asArray(filters.states);
+    const sources = asArray(filters.source);
     return sessions.filter((session) => {
+      // 候补场次不占正式排期，不在主清单显示
+      if (session.state === '候补') return false;
       const song = songOf(session.songId);
       const label = `${song ? song.title : ''} ${projectNameOf(session.songId)} ${session.engineer} ${session.musicians} ${session.roomNo}`.toLowerCase();
       if (keyword && !label.includes(keyword)) return false;
       if (rooms.length > 0 && !rooms.includes(session.roomNo)) return false;
       if (periods.length > 0 && !periods.includes(session.period)) return false;
       if (states.length > 0 && !states.includes(session.state)) return false;
+      if (sources.length > 0 && !sources.includes(session.source)) return false;
       return true;
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -115,11 +143,11 @@ export default function SessionPlan() {
     ? filtered.filter((session) => songOf(session.songId)?.projectId === currentProjectId)
     : filtered;
 
-  /** 棚号时段占用矩阵提示：同一棚号同一天同一时段出现多次即为冲突 */
+  /** 棚号时段占用矩阵提示：同一棚号同一天同一时段出现多次即为冲突（候补不占位） */
   const conflicts = useMemo(() => {
     const seen = new Map<string, number>();
     sessions.forEach((session) => {
-      if (session.state === '已取消') return;
+      if (session.state === '已取消' || session.state === '候补') return;
       const key = `${session.roomNo}|${session.date}|${session.period}`;
       seen.set(key, (seen.get(key) ?? 0) + 1);
     });
@@ -127,6 +155,9 @@ export default function SessionPlan() {
       .filter(([, count]) => count > 1)
       .map(([key]) => key.replace(/\|/g, ' · '));
   }, [sessions]);
+
+  const pendingCount = useMemo(() => pendings.filter((item) => item.status === '待定').length, [pendings]);
+  const waitlistCount = useMemo(() => sessions.filter((item) => item.state === '候补').length, [sessions]);
 
   const totals = useMemo(() => {
     const relevantTakes = takes.filter((take) =>
@@ -170,32 +201,70 @@ export default function SessionPlan() {
       <div className="page__head">
         <div>
           <h2 className="page__title">场次安排与参与乐手</h2>
-          <p className="page__subtitle">同一棚号同一天同一时段只允许一场；冲突会被拦截并提示占用场次。</p>
+          <p className="page__subtitle">
+            同一棚号同一天同一时段只允许一场；离线包按稳定编号合并，待定选定前不写正式排期。
+          </p>
         </div>
-        <Button
-          type="primary"
-          icon={<PlusOutlined />}
-          disabled={songs.length === 0}
-          onClick={() => {
-            setEditing(null);
-            setError(null);
-            form.setFieldsValue({
-              ...createEmptySession(),
-              songId: songs.find((song) => song.projectId === currentProjectId)?.id ?? songs[0]?.id ?? ''
-            });
-            setDialogOpen(true);
-          }}
-        >
-          新增场次
-        </Button>
+        <Space>
+          <Button icon={<ImportOutlined />} onClick={() => setImportOpen(true)}>
+            导入离线包
+          </Button>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            disabled={songs.length === 0}
+            onClick={() => {
+              setEditing(null);
+              setError(null);
+              form.setFieldsValue({
+                ...createEmptySession(),
+                songId: songs.find((song) => song.projectId === currentProjectId)?.id ?? songs[0]?.id ?? ''
+              });
+              setDialogOpen(true);
+            }}
+          >
+            新增场次
+          </Button>
+        </Space>
       </div>
+
+      {resumableDraftId ? (
+        <Alert
+          type="warning"
+          showIcon
+          message="有未完成的离线包导入"
+          description="上次导入中断，草稿已保住。可接着处理，已追加 / 已待定的场次不会重复。"
+          action={
+            <Space>
+              <Button
+                size="small"
+                type="primary"
+                onClick={async () => {
+                  try {
+                    await resumeDraft(resumableDraftId);
+                    message.success('已接着处理完成');
+                    await refreshResumable();
+                  } catch (error) {
+                    message.error(`续跑失败：${error instanceof Error ? error.message : '未知错误'}`);
+                  }
+                }}
+              >
+                接着处理
+              </Button>
+              <Button size="small" onClick={() => setImportOpen(true)}>
+                查看草稿
+              </Button>
+            </Space>
+          }
+        />
+      ) : null}
 
       <div className="badge-row">
         <StatBadge label="场次数" value={totals.sessionCount} suffix="场" tone="primary" icon="files" />
         <StatBadge label="已排期" value={totals.scheduled} suffix="场" tone="warning" icon="grid" />
         <StatBadge label="已完成" value={totals.done} suffix="场" tone="success" icon="histogram" />
-        <StatBadge label="乐手席位" value={totals.musicianSlots} suffix="人次" tone="info" icon="trend" />
-        <StatBadge label="已录时长" value={totals.durationText} tone="danger" icon="pie" />
+        <StatBadge label="待定" value={pendingCount} suffix="项" tone="warning" icon="warning" />
+        <StatBadge label="候补" value={waitlistCount} suffix="场" tone="danger" icon="pie" />
       </div>
 
       {conflicts.length > 0 ? (
@@ -220,10 +289,14 @@ export default function SessionPlan() {
         }}
       />
 
+      <PendingPanel />
+
+      <WaitlistPanel />
+
       {scopedSessions.length === 0 ? (
         <EmptyPanel
           title="暂无场次安排"
-          description="为曲目安排录制场次，填写棚号、时段、录音师与参与乐手。"
+          description="为曲目安排录制场次，填写棚号、时段、录音师与参与乐手；或导入离线包按稳定编号合并。"
           createText="新增场次"
           showCreate={songs.length > 0}
           onCreate={() => {
@@ -256,6 +329,17 @@ export default function SessionPlan() {
               { title: '棚号', dataIndex: 'roomNo', width: 100 },
               { title: '录音师', dataIndex: 'engineer', width: 100 },
               { title: '参与乐手', dataIndex: 'musicians', minWidth: 200 },
+              {
+                title: '来源',
+                dataIndex: 'source',
+                width: 100,
+                render: (value: string, row) => (
+                  <Space direction="vertical" size={0}>
+                    <Tag color={value === '离线包' ? 'cyan' : 'default'}>{value}</Tag>
+                    {row.packageNo ? <span className="muted">{row.packageNo}</span> : null}
+                  </Space>
+                )
+              },
               {
                 title: '状态',
                 dataIndex: 'state',
@@ -356,6 +440,17 @@ export default function SessionPlan() {
           </Form.Item>
         </Form>
       </Modal>
+
+      <OfflineImportModal
+        open={importOpen}
+        onClose={() => {
+          setImportOpen(false);
+          void refreshResumable();
+        }}
+        onImported={() => {
+          void refreshResumable();
+        }}
+      />
     </div>
   );
 }

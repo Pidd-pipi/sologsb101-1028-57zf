@@ -1,7 +1,7 @@
 /**
  * IndexedDB 持久化层（Dexie 封装）
- * - 数据库名 gbstudiotake-db，数据结构版本号 version(1) 与 upgrade() 迁移逻辑
- * - 项目 / 曲目 / 场次 / Take / 优选 / 补录 六张表分表存储
+ * - 数据库名 gbstudiotake-db，数据结构版本号 version(2) 与 upgrade() 迁移逻辑
+ * - 项目 / 曲目 / 场次 / Take / 优选 / 补录 六张主表，加 待定场次 / 导入草稿 两张工作表
  * - 首次打开自动播种互相引用的演示数据，保证每个页面打开都有内容
  */
 import Dexie, { type Table } from 'dexie';
@@ -11,15 +11,17 @@ import type { Session } from '../types/session';
 import type { Take } from '../types/take';
 import type { Pick } from '../types/pick';
 import type { Retake } from '../types/retake';
+import type { ImportDraft, PendingSession } from '../types/offline';
 import { nowIso } from './uuid';
 import { seedDatabase } from './seed';
 import { ROW_REVISION } from './revision';
+import { evaluateCapacity } from './capacity';
 
 /** 数据库名 */
 export const DB_NAME = 'gbstudiotake-db';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 1;
+export const DB_SCHEMA_VERSION = 2;
 
 /** 行结构修订号（定义在叶子模块 ./revision，避免与 ./seed 形成循环依赖） */
 export { ROW_REVISION };
@@ -36,6 +38,8 @@ export type SessionRow = Session & Revisioned;
 export type TakeRow = Take & Revisioned;
 export type PickRow = Pick & Revisioned;
 export type RetakeRow = Retake & Revisioned;
+export type PendingSessionRow = PendingSession & Revisioned;
+export type ImportDraftRow = ImportDraft & Revisioned;
 
 export class GbStudioTakeDatabase extends Dexie {
   projects!: Table<ProjectRow, string>;
@@ -44,6 +48,8 @@ export class GbStudioTakeDatabase extends Dexie {
   takes!: Table<TakeRow, string>;
   picks!: Table<PickRow, string>;
   retakes!: Table<RetakeRow, string>;
+  pendingSessions!: Table<PendingSessionRow, string>;
+  importDrafts!: Table<ImportDraftRow, string>;
 
   constructor() {
     super(DB_NAME);
@@ -52,13 +58,15 @@ export class GbStudioTakeDatabase extends Dexie {
       .stores({
         projects: 'id, name, client, state, startDate, updatedAt',
         songs: 'id, projectId, title, arrangement, state, updatedAt',
-        sessions: 'id, songId, date, period, roomNo, engineer, state, updatedAt',
+        sessions: 'id, songId, date, period, roomNo, engineer, state, source, packageNo, submittedAt, updatedAt',
         takes: 'id, sessionId, takeNo, grade, startTc, updatedAt',
         picks: 'id, takeId, usage, order, updatedAt',
-        retakes: 'id, songId, planDate, state, updatedAt'
+        retakes: 'id, songId, planDate, state, updatedAt',
+        pendingSessions: 'id, sessionStableId, packageNo, status, createdAt',
+        importDrafts: 'id, packageNo, status, updatedAt'
       })
       .upgrade(async (tx) => {
-        // 结构迁移：为历史行补齐行修订号与时间戳；新建库时各表为空，迁移天然幂等
+        // v1 迁移：为历史行补齐行修订号与时间戳
         const tableNames = ['projects', 'songs', 'sessions', 'takes', 'picks', 'retakes'];
         for (const name of tableNames) {
           await tx
@@ -70,6 +78,16 @@ export class GbStudioTakeDatabase extends Dexie {
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt;
             });
         }
+        // v2 迁移：旧场次记录升级后也参与容量核算 —— 补齐来源与提交时间
+        await tx
+          .table('sessions')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            row.revision = ROW_REVISION;
+            if (typeof row.source !== 'string') row.source = '本地';
+            if (typeof row.packageNo !== 'string') row.packageNo = '';
+            if (typeof row.submittedAt !== 'number') row.submittedAt = row.createdAt ?? Date.now();
+          });
       });
   }
 }
@@ -99,15 +117,19 @@ export async function updateProject(id: string, patch: Partial<Project>): Promis
   await db.projects.update(id, { ...patch, updatedAt: Date.now() } as never);
 }
 
-/** 删除项目：级联删除曲目、场次、Take、优选与补录 */
+/** 删除项目：级联删除曲目、场次、Take、优选、补录、待定场次与导入草稿 */
 export async function removeProject(id: string): Promise<void> {
-  await db.transaction('rw', [db.projects, db.songs, db.sessions, db.takes, db.picks, db.retakes], async () => {
-    const songs = await db.songs.where('projectId').equals(id).toArray();
-    for (const song of songs) {
-      await cascadeRemoveSong(song.id);
+  await db.transaction(
+    'rw',
+    [db.projects, db.songs, db.sessions, db.takes, db.picks, db.retakes, db.pendingSessions, db.importDrafts],
+    async () => {
+      const songs = await db.songs.where('projectId').equals(id).toArray();
+      for (const song of songs) {
+        await cascadeRemoveSong(song.id);
+      }
+      await db.projects.delete(id);
     }
-    await db.projects.delete(id);
-  });
+  );
 }
 
 /* ------------------------------ 曲目 ------------------------------ */
@@ -135,6 +157,8 @@ async function cascadeRemoveSong(songId: string): Promise<void> {
       await db.picks.where('takeId').anyOf(takeIds).delete();
     }
     await db.takes.where('sessionId').anyOf(sessionIds).delete();
+    // 待定场次随场次一并清理
+    await db.pendingSessions.where('sessionStableId').anyOf(sessionIds).delete();
     await db.sessions.where('songId').equals(songId).delete();
   }
   await db.retakes.where('songId').equals(songId).delete();
@@ -142,9 +166,13 @@ async function cascadeRemoveSong(songId: string): Promise<void> {
 }
 
 export async function removeSong(id: string): Promise<void> {
-  await db.transaction('rw', [db.songs, db.sessions, db.takes, db.picks, db.retakes], async () => {
-    await cascadeRemoveSong(id);
-  });
+  await db.transaction(
+    'rw',
+    [db.songs, db.sessions, db.takes, db.picks, db.retakes, db.pendingSessions],
+    async () => {
+      await cascadeRemoveSong(id);
+    }
+  );
 }
 
 /* ------------------------------ 场次 ------------------------------ */
@@ -163,7 +191,7 @@ export async function updateSession(id: string, patch: Partial<Session>): Promis
 }
 
 /**
- * 校验棚号时段冲突：同一棚号同一日期同一时段只能有一场（已取消的除外）
+ * 校验棚号时段冲突：同一棚号同一日期同一时段只能有一场（已取消 / 候补 除外）
  * @param selfId 编辑自身时排除
  */
 export async function findRoomConflict(
@@ -175,22 +203,141 @@ export async function findRoomConflict(
   const rows = await db.sessions
     .where('roomNo')
     .equals(roomNo)
-    .filter((item) => item.date === date && item.period === period && item.state !== '已取消' && item.id !== selfId)
+    .filter(
+      (item) =>
+        item.date === date &&
+        item.period === period &&
+        item.state !== '已取消' &&
+        item.state !== '候补' &&
+        item.id !== selfId
+    )
     .toArray();
   return rows[0] ?? null;
 }
 
-/** 删除场次：级联删除其 Take 与对应优选 */
+/**
+ * 容量重算：棚号或乐手一变就重算。
+ * - 超容 → 置为候补（保留提交时间，按提交顺序排队），不挤掉已确认场次
+ * - 未超容且当前为候补 → 尝试转正（棚号时段仍被占则继续候补）
+ * 返回重算后的场次与容量结果。
+ */
+export async function recalcSessionCapacity(sessionId: string): Promise<{
+  session: SessionRow;
+  capacity: ReturnType<typeof evaluateCapacity>;
+  promoted: boolean;
+}> {
+  const session = await db.sessions.get(sessionId);
+  if (!session) throw new Error('场次不存在');
+  const capacity = evaluateCapacity(session.musicians, session.roomNo);
+  let promoted = false;
+
+  if (capacity.over) {
+    // 容量不足：候补，提交时间取最早提交时间（排队顺序不变）
+    await db.sessions.update(sessionId, {
+      state: '候补',
+      submittedAt: session.submittedAt ?? session.createdAt ?? Date.now(),
+      updatedAt: Date.now()
+    } as never);
+  } else if (session.state === '候补') {
+    // 容量足够：尝试转正（先确认棚号时段仍空闲）
+    const conflict = await findRoomConflict(session.roomNo, session.date, session.period, sessionId);
+    if (conflict) {
+      // 时段已被占，继续候补
+      await db.sessions.update(sessionId, { updatedAt: Date.now() } as never);
+    } else {
+      await db.sessions.update(sessionId, { state: '已排期', updatedAt: Date.now() } as never);
+      promoted = true;
+    }
+  }
+
+  const updated = await db.sessions.get(sessionId);
+  return { session: updated as SessionRow, capacity, promoted };
+}
+
+/** 删除场次：级联删除其 Take、对应优选与待定记录 */
 export async function removeSession(id: string): Promise<void> {
-  await db.transaction('rw', [db.sessions, db.takes, db.picks], async () => {
+  await db.transaction('rw', [db.sessions, db.takes, db.picks, db.pendingSessions], async () => {
     const takes = await db.takes.where('sessionId').equals(id).toArray();
     const takeIds = takes.map((item) => item.id);
     if (takeIds.length > 0) {
       await db.picks.where('takeId').anyOf(takeIds).delete();
     }
     await db.takes.where('sessionId').equals(id).delete();
+    await db.pendingSessions.where('sessionStableId').equals(id).delete();
     await db.sessions.delete(id);
   });
+}
+
+/* ------------------------------ 待定场次 ------------------------------ */
+
+export async function listPendingSessions(): Promise<PendingSessionRow[]> {
+  const rows = await db.pendingSessions.toArray();
+  return rows.sort((a, b) => b.createdAt - a.createdAt);
+}
+
+export async function putPendingSession(row: PendingSessionRow): Promise<void> {
+  await db.pendingSessions.put(row);
+}
+
+export async function updatePendingSession(id: string, patch: Partial<PendingSession>): Promise<void> {
+  await db.pendingSessions.update(id, { ...patch, updatedAt: Date.now() } as never);
+}
+
+/** 同一场次同一离线包是否已有待定记录（幂等：续跑导入不重复生成） */
+export async function findPendingSession(
+  sessionStableId: string,
+  packageNo: string
+): Promise<PendingSessionRow | null> {
+  const rows = await db.pendingSessions
+    .where('sessionStableId')
+    .equals(sessionStableId)
+    .filter((item) => item.packageNo === packageNo && item.status === '待定')
+    .toArray();
+  return rows[0] ?? null;
+}
+
+/**
+ * 制作人选定待定场次：采用本地现值或离线包值。
+ * 采用后写回正式排期并重算容量（棚号 / 乐手可能变化）。
+ */
+export async function resolvePendingSession(
+  pendingId: string,
+  choice: 'local' | 'package'
+): Promise<{ session: SessionRow; capacity: ReturnType<typeof evaluateCapacity> }> {
+  const pending = await db.pendingSessions.get(pendingId);
+  if (!pending) throw new Error('待定记录不存在');
+  const valueSet = choice === 'local' ? pending.local : pending.pkg;
+  const status = choice === 'local' ? '已采用本地' : '已采用离线';
+
+  await db.transaction('rw', [db.pendingSessions, db.sessions], async () => {
+    await db.pendingSessions.update(pendingId, { status, resolvedAt: Date.now(), updatedAt: Date.now() } as never);
+    await db.sessions.update(
+      pending.sessionStableId,
+      { roomNo: valueSet.roomNo, period: valueSet.period, musicians: valueSet.musicians, updatedAt: Date.now() } as never
+    );
+  });
+
+  const { session, capacity } = await recalcSessionCapacity(pending.sessionStableId);
+  return { session, capacity };
+}
+
+/* ------------------------------ 导入草稿 ------------------------------ */
+
+export async function listImportDrafts(): Promise<ImportDraftRow[]> {
+  const rows = await db.importDrafts.toArray();
+  return rows.sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+export async function putImportDraft(row: ImportDraftRow): Promise<void> {
+  await db.importDrafts.put(row);
+}
+
+export async function updateImportDraft(id: string, patch: Partial<ImportDraft>): Promise<void> {
+  await db.importDrafts.update(id, { ...patch, updatedAt: Date.now() } as never);
+}
+
+export async function deleteImportDraft(id: string): Promise<void> {
+  await db.importDrafts.delete(id);
 }
 
 /* ------------------------------ Take ------------------------------ */
@@ -339,6 +486,11 @@ function stamp<T>(row: T): T & Revisioned {
   return { ...row, revision: ROW_REVISION, createdAt: now, updatedAt: now };
 }
 
+/** 补齐旧备份场次可能缺失的来源字段 */
+function normalizeSession(row: Session): Session {
+  return { ...row, source: row.source ?? '本地', packageNo: row.packageNo ?? '' };
+}
+
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
   await db.transaction('rw', [db.projects, db.songs, db.sessions, db.takes, db.picks, db.retakes], async () => {
     await Promise.all([
@@ -351,7 +503,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     ]);
     await db.projects.bulkPut(snapshot.projects.map(stamp));
     await db.songs.bulkPut(snapshot.songs.map(stamp));
-    await db.sessions.bulkPut(snapshot.sessions.map(stamp));
+    await db.sessions.bulkPut(snapshot.sessions.map(normalizeSession).map(stamp));
     await db.takes.bulkPut(snapshot.takes.map(stamp));
     await db.picks.bulkPut(snapshot.picks.map(stamp));
     await db.retakes.bulkPut(snapshot.retakes.map(stamp));
@@ -360,28 +512,36 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
 
 /** 清空全部数据并重新灌入演示数据 */
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', [db.projects, db.songs, db.sessions, db.takes, db.picks, db.retakes], async () => {
-    await Promise.all([
-      db.projects.clear(),
-      db.songs.clear(),
-      db.sessions.clear(),
-      db.takes.clear(),
-      db.picks.clear(),
-      db.retakes.clear()
-    ]);
-  });
+  await db.transaction(
+    'rw',
+    [db.projects, db.songs, db.sessions, db.takes, db.picks, db.retakes, db.pendingSessions, db.importDrafts],
+    async () => {
+      await Promise.all([
+        db.projects.clear(),
+        db.songs.clear(),
+        db.sessions.clear(),
+        db.takes.clear(),
+        db.picks.clear(),
+        db.retakes.clear(),
+        db.pendingSessions.clear(),
+        db.importDrafts.clear()
+      ]);
+    }
+  );
   await seedDatabase(db);
 }
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [projects, songs, sessions, takes, picks, retakes] = await Promise.all([
+  const [projects, songs, sessions, takes, picks, retakes, pendingSessions, importDrafts] = await Promise.all([
     db.projects.count(),
     db.songs.count(),
     db.sessions.count(),
     db.takes.count(),
     db.picks.count(),
-    db.retakes.count()
+    db.retakes.count(),
+    db.pendingSessions.count(),
+    db.importDrafts.count()
   ]);
-  return { projects, songs, sessions, takes, picks, retakes };
+  return { projects, songs, sessions, takes, picks, retakes, pendingSessions, importDrafts };
 }

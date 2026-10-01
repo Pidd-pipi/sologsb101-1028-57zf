@@ -360,6 +360,10 @@ export default function RetakePlan() {
                 <Descriptions.Item label="优选 / 补录">
                   {counts.picks ?? 0} / {counts.retakes ?? 0}
                 </Descriptions.Item>
+                <Descriptions.Item label="待定 / 候补 / 中断草稿">
+                  {counts.pending ?? 0} /{' '}
+                  {sessions.filter((item) => item.state === '候补').length} / {counts.drafts ?? 0}
+                </Descriptions.Item>
                 <Descriptions.Item label="记录表生成时间">
                   {sheet ? sheet.exportedAt.slice(0, 19).replace('T', ' ') : '—'}
                 </Descriptions.Item>

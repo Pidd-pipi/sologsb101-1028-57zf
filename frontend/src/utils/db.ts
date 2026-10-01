@@ -11,15 +11,17 @@ import type { Session } from '../types/session';
 import type { Take } from '../types/take';
 import type { Pick } from '../types/pick';
 import type { Retake } from '../types/retake';
+import type { ImportDraft, MergePending } from '../types/merge';
 import { nowIso } from './uuid';
 import { seedDatabase } from './seed';
 import { ROW_REVISION } from './revision';
+import { recomputeCapacity } from './capacity';
 
 /** 数据库名 */
 export const DB_NAME = 'gbstudiotake-db';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 1;
+export const DB_SCHEMA_VERSION = 2;
 
 /** 行结构修订号（定义在叶子模块 ./revision，避免与 ./seed 形成循环依赖） */
 export { ROW_REVISION };
@@ -36,6 +38,9 @@ export type SessionRow = Session & Revisioned;
 export type TakeRow = Take & Revisioned;
 export type PickRow = Pick & Revisioned;
 export type RetakeRow = Retake & Revisioned;
+/** 合并待定自身带时间戳，不再叠加 Revisioned */
+export type MergePendingRow = MergePending;
+export type ImportDraftRow = ImportDraft;
 
 export class GbStudioTakeDatabase extends Dexie {
   projects!: Table<ProjectRow, string>;
@@ -44,11 +49,15 @@ export class GbStudioTakeDatabase extends Dexie {
   takes!: Table<TakeRow, string>;
   picks!: Table<PickRow, string>;
   retakes!: Table<RetakeRow, string>;
+  /** 离线包合并待定（制作人二选一裁决） */
+  mergePending!: Table<MergePendingRow, string>;
+  /** 导入中断草稿（按稳定编号续写） */
+  importDrafts!: Table<ImportDraftRow, string>;
 
   constructor() {
     super(DB_NAME);
 
-    this.version(DB_SCHEMA_VERSION)
+    this.version(1)
       .stores({
         projects: 'id, name, client, state, startDate, updatedAt',
         songs: 'id, projectId, title, arrangement, state, updatedAt',
@@ -65,9 +74,45 @@ export class GbStudioTakeDatabase extends Dexie {
             .table(name)
             .toCollection()
             .modify((row: Record<string, unknown>) => {
-              row.revision = ROW_REVISION;
+              row.revision = 1;
               if (typeof row.createdAt !== 'number') row.createdAt = Date.now();
               if (typeof row.updatedAt !== 'number') row.updatedAt = row.createdAt;
+            });
+        }
+      });
+
+    // v2：离线包合并 —— 场次带来源 / 提交时间，新增 mergePending 与 importDrafts 表；
+    // 旧场次升级后来源标 local、回填 submittedAt，同样参与容量核算。
+    this.version(2)
+      .stores({
+        projects: 'id, name, client, state, startDate, updatedAt',
+        songs: 'id, projectId, title, arrangement, state, updatedAt',
+        sessions: 'id, songId, date, period, roomNo, engineer, state, source, submittedAt, updatedAt',
+        takes: 'id, sessionId, takeNo, grade, startTc, updatedAt',
+        picks: 'id, takeId, usage, order, updatedAt',
+        retakes: 'id, songId, planDate, state, updatedAt',
+        mergePending: 'id, packageNo, sessionId, createdAt',
+        importDrafts: 'id, packageNo, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        const stamp = Date.now();
+        await tx
+          .table('sessions')
+          .toCollection()
+          .modify((row: Record<string, unknown>) => {
+            row.source = 'local';
+            // 旧场次按日期凌晨 + 已存在 updatedAt 回填提交时间，保证有稳定排队顺序
+            const datePart = typeof row.date === 'string' ? new Date(`${row.date}T00:00:00`).getTime() : NaN;
+            row.submittedAt = Number.isFinite(datePart) ? datePart : typeof row.updatedAt === 'number' ? row.updatedAt : stamp;
+            row.revision = ROW_REVISION;
+            row.updatedAt = stamp;
+          });
+        for (const name of ['projects', 'songs', 'takes', 'picks', 'retakes']) {
+          await tx
+            .table(name)
+            .toCollection()
+            .modify((row: Record<string, unknown>) => {
+              row.revision = ROW_REVISION;
             });
         }
       });
@@ -163,6 +208,40 @@ export async function updateSession(id: string, patch: Partial<Session>): Promis
 }
 
 /**
+ * 棚号 / 时段 / 乐手变更后的容量重算并落库：
+ * 已确认场次（已排期 / 已完成）锁定不降级，放不下的场次按提交顺序转候补。
+ */
+export async function recalculateCapacities(): Promise<number> {
+  return db.transaction('rw', [db.sessions], async () => {
+    const sessions = await db.sessions.toArray();
+    const nextStates = recomputeCapacity(
+      sessions.map((row) => ({
+        id: row.id,
+        songId: row.songId,
+        date: row.date,
+        period: row.period,
+        engineer: row.engineer,
+        roomNo: row.roomNo,
+        musicians: row.musicians,
+        state: row.state,
+        source: row.source,
+        submittedAt: row.submittedAt
+      }))
+    );
+    const now = Date.now();
+    let changed = 0;
+    for (const session of sessions) {
+      const next = nextStates.get(session.id);
+      if (next && next !== session.state) {
+        await db.sessions.update(session.id, { state: next, updatedAt: now } as never);
+        changed += 1;
+      }
+    }
+    return changed;
+  });
+}
+
+/**
  * 校验棚号时段冲突：同一棚号同一日期同一时段只能有一场（已取消的除外）
  * @param selfId 编辑自身时排除
  */
@@ -175,7 +254,14 @@ export async function findRoomConflict(
   const rows = await db.sessions
     .where('roomNo')
     .equals(roomNo)
-    .filter((item) => item.date === date && item.period === period && item.state !== '已取消' && item.id !== selfId)
+    .filter(
+      (item) =>
+        item.date === date &&
+        item.period === period &&
+        item.state !== '已取消' &&
+        item.state !== '候补' &&
+        item.id !== selfId
+    )
     .toArray();
   return rows[0] ?? null;
 }
@@ -339,49 +425,107 @@ function stamp<T>(row: T): T & Revisioned {
   return { ...row, revision: ROW_REVISION, createdAt: now, updatedAt: now };
 }
 
+/** 供离线包合并等模块复用的行时间戳盖章 */
+export function stampRow<T>(row: T, at: number = Date.now()): T & Revisioned {
+  return { ...row, revision: ROW_REVISION, createdAt: at, updatedAt: at };
+}
+
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', [db.projects, db.songs, db.sessions, db.takes, db.picks, db.retakes], async () => {
-    await Promise.all([
-      db.projects.clear(),
-      db.songs.clear(),
-      db.sessions.clear(),
-      db.takes.clear(),
-      db.picks.clear(),
-      db.retakes.clear()
-    ]);
-    await db.projects.bulkPut(snapshot.projects.map(stamp));
-    await db.songs.bulkPut(snapshot.songs.map(stamp));
-    await db.sessions.bulkPut(snapshot.sessions.map(stamp));
-    await db.takes.bulkPut(snapshot.takes.map(stamp));
-    await db.picks.bulkPut(snapshot.picks.map(stamp));
-    await db.retakes.bulkPut(snapshot.retakes.map(stamp));
-  });
+  await db.transaction(
+    'rw',
+    [db.projects, db.songs, db.sessions, db.takes, db.picks, db.retakes, db.mergePending, db.importDrafts],
+    async () => {
+      await Promise.all([
+        db.projects.clear(),
+        db.songs.clear(),
+        db.sessions.clear(),
+        db.takes.clear(),
+        db.picks.clear(),
+        db.retakes.clear(),
+        db.mergePending.clear(),
+        db.importDrafts.clear()
+      ]);
+      await db.projects.bulkPut(snapshot.projects.map(stamp));
+      await db.songs.bulkPut(snapshot.songs.map(stamp));
+      await db.sessions.bulkPut(snapshot.sessions.map(stamp));
+      await db.takes.bulkPut(snapshot.takes.map(stamp));
+      await db.picks.bulkPut(snapshot.picks.map(stamp));
+      await db.retakes.bulkPut(snapshot.retakes.map(stamp));
+    }
+  );
 }
 
 /** 清空全部数据并重新灌入演示数据 */
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', [db.projects, db.songs, db.sessions, db.takes, db.picks, db.retakes], async () => {
-    await Promise.all([
-      db.projects.clear(),
-      db.songs.clear(),
-      db.sessions.clear(),
-      db.takes.clear(),
-      db.picks.clear(),
-      db.retakes.clear()
-    ]);
-  });
+  await db.transaction(
+    'rw',
+    [db.projects, db.songs, db.sessions, db.takes, db.picks, db.retakes, db.mergePending, db.importDrafts],
+    async () => {
+      await Promise.all([
+        db.projects.clear(),
+        db.songs.clear(),
+        db.sessions.clear(),
+        db.takes.clear(),
+        db.picks.clear(),
+        db.retakes.clear(),
+        db.mergePending.clear(),
+        db.importDrafts.clear()
+      ]);
+    }
+  );
   await seedDatabase(db);
 }
 
 /** 各表行数统计 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [projects, songs, sessions, takes, picks, retakes] = await Promise.all([
+  const [projects, songs, sessions, takes, picks, retakes, pending, drafts] = await Promise.all([
     db.projects.count(),
     db.songs.count(),
     db.sessions.count(),
     db.takes.count(),
     db.picks.count(),
-    db.retakes.count()
+    db.retakes.count(),
+    db.mergePending.count(),
+    db.importDrafts.count()
   ]);
-  return { projects, songs, sessions, takes, picks, retakes };
+  return { projects, songs, sessions, takes, picks, retakes, pending, drafts };
+}
+
+/* --------------------------- 离线包：待定与草稿 --------------------------- */
+
+export async function listMergePending(): Promise<MergePendingRow[]> {
+  const rows = await db.mergePending.toArray();
+  return rows.sort((a, b) => a.createdAt - b.createdAt);
+}
+
+export async function putMergePending(row: MergePendingRow): Promise<void> {
+  await db.mergePending.put(row);
+}
+
+export async function bulkPutMergePending(rows: MergePendingRow[]): Promise<void> {
+  await db.mergePending.bulkPut(rows);
+}
+
+export async function getMergePending(id: string): Promise<MergePendingRow | undefined> {
+  return db.mergePending.get(id);
+}
+
+export async function removeMergePending(id: string): Promise<void> {
+  await db.mergePending.delete(id);
+}
+
+export async function listImportDrafts(): Promise<ImportDraftRow[]> {
+  return db.importDrafts.toArray();
+}
+
+export async function getImportDraft(packageNo: string): Promise<ImportDraftRow | undefined> {
+  return db.importDrafts.get(packageNo);
+}
+
+export async function putImportDraft(row: ImportDraftRow): Promise<void> {
+  await db.importDrafts.put(row);
+}
+
+export async function removeImportDraft(packageNo: string): Promise<void> {
+  await db.importDrafts.delete(packageNo);
 }

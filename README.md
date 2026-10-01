@@ -57,6 +57,7 @@ npm install
 npm run dev        # 开发服务器 http://localhost:22828
 npm run build      # 类型检查 + 生产构建，产物在 frontend/dist
 npm run preview    # 本地预览构建产物（http://localhost:22828）
+npm run verify     # 离线包合并规则与 v1→v2 结构升级的端到端断言（fake-indexeddb）
 ```
 
 ---
@@ -66,10 +67,19 @@ npm run preview    # 本地预览构建产物（http://localhost:22828）
 | 路由 | 模块 | 消费模型 | 主要交互 |
 | --- | --- | --- | --- |
 | `/projects` | 录音项目与曲目台账 | Project、Song | 新建/编辑/删除项目与曲目（删除确认与级联）、按状态与委托方筛选、卡片回显曲目数 / 场次数 / 已优选 Take 数、筛选同步 URL query |
-| `/sessions` | 场次安排与参与乐手 | Session、Song | 按日期与棚号排期、**同棚号同时段冲突真实拦截并列出占用场次**、乐手席位统计、增删改 |
+| `/sessions` | 场次安排与参与乐手 | Session、Song、MergePending、ImportDraft | 按日期与棚号排期、**同棚号同时段冲突真实拦截并列出占用场次**、乐手席位容量核算（容量不足按提交顺序候补，不挤掉已确认场次）、**外勤离线包按稳定编号合并（新增曲目/Take 直接接上、两套值先列待定、中断草稿续写）**、来源 / 待定 / 候补数量展示、增删改 |
 | `/takes` | Take 标记台 | Take、Session | 录入起止时间码（校验先后、重叠提示）、同场次 Take 号自动递增、问题标签与评级、**表格多选批量改评级**、时间码区间筛选 |
 | `/picks` | 优选 Take 汇总 | Pick、Take | 从「可用」条次中挑选、**拖拽卡片 + 上下移调整剪接顺序**、自动生成剪接清单与合计时长、备注编辑 |
 | `/retakes` | 补录计划与导出 | Retake 及全部模型 | 由问题 Take 一键生成补录、状态流转与完成联动曲目状态、场次记录表导出、本地库版本查看与整库导入导出 |
+
+### 外勤离线包合并规则（/sessions）
+
+- **按稳定编号合并，整包不覆盖当天安排**：离线包带 `packageNo`（如 `PKG-20261001-1530`），不同曲目、新增场次与新增 Take 按稳定 id 直接接上；同一编号重复导入幂等，不产生重复数据。
+- **两套值先列待定**：同一场次的棚号、时段、乐手在本地与离线包中不一致时进入「待定」，制作人在裁决面板二选一（采用本地 / 采用离线包），**选定前不写正式排期**，其新增 Take / 优选随待定暂挂，裁决后补写。
+- **容量冲突重算**：场次带来源（本地 / 离线包）与提交时间；槽位 = 棚号 + 日期 + 时段，按各棚乐手席位容量（A/B 棚 25、C 棚 8、大排练厅 60）核算。棚号或乐手一变立即重算；容量不足的场次按提交顺序进**候补**，永远不会挤掉「已排期 / 已完成」的已确认场次。
+- **导入中断保住草稿**：合并前先写 `importDrafts` 草稿，中断后重新导入同一编号即可接着处理；待定点独立持久化在 `mergePending` 表。
+- **旧场次参与核算**：IndexedDB v1→v2 升级时为旧场次回填来源 `local` 与提交时间，升级后同样参与容量核算。
+- 页面顶部徽标与提示实时显示**来源、待定、候补**数量及中断草稿入口。
 
 ---
 
@@ -89,11 +99,13 @@ sologsb101-1028/
     ├── public/favicon.svg
     └── src/
         ├── main.tsx  App.tsx  vite-env.d.ts
-        ├── types/              # project.ts song.ts session.ts take.ts pick.ts retake.ts filter.ts
-        ├── stores/             # projectStore sessionStore takeStore pickStore
+        ├── types/              # project.ts song.ts session.ts take.ts pick.ts retake.ts filter.ts merge.ts
+        ├── stores/             # projectStore sessionStore takeStore pickStore importStore
         ├── components/common/  # TakeBadge.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx
+        ├── components/merge/   # ImportPackageModal.tsx ExportPackageModal.tsx MergePendingPanel.tsx
         ├── hooks/              # useTakeFilter.ts useIdbTable.ts
-        ├── utils/              # timecode.ts db.ts export.ts seed.ts uuid.ts
+        ├── utils/              # timecode.ts db.ts export.ts offlinePackage.ts capacity.ts seed.ts uuid.ts
+        ├── scripts/            # verify-merge.ts verify-migration.ts（离线包合并与结构升级端到端断言）
         ├── pages/              # ProjectList SessionPlan TakeBoard PickSummary RetakePlan
         ├── styles/main.css
         ├── router/index.tsx    # 路由表（懒加载页面 + App 布局）
@@ -105,8 +117,8 @@ sologsb101-1028/
 
 ## 六、数据存储说明
 
-- **IndexedDB 库名**：`gbstudiotake-db`（Dexie 封装），结构版本号 `version(1)`，并带 `upgrade()` 迁移逻辑（为历史行补齐行修订号与时间戳）。
-- **分表存储**：`projects` 项目、`songs` 曲目、`sessions` 场次、`takes` 条次、`picks` 优选、`retakes` 补录，共 6 张表；每行带 `revision` / `createdAt` / `updatedAt`。
+- **IndexedDB 库名**：`gbstudiotake-db`（Dexie 封装），结构版本号 `version(2)`，带 v1→v2 `upgrade()` 迁移逻辑（为旧场次回填 `source` / `submittedAt`，旧场次升级后参与容量核算）。
+- **分表存储**：`projects` 项目、`songs` 曲目、`sessions` 场次（新增 `source` / `submittedAt` 与「候补」状态）、`takes` 条次、`picks` 优选、`retakes` 补录、`mergePending` 离线包合并待定、`importDrafts` 导入中断草稿，共 8 张表；每行带 `revision` / `createdAt` / `updatedAt`（后两张流程表除外）。
 - **首屏自动播种**：`utils/db.ts` 的 `initDatabase()` 在 `projects` 表为空时调用 `seedDatabase()`，灌入互相引用的三层演示数据（项目 → 曲目 → 场次 → Take → 优选 / 补录），保证 5 个页面首次打开都有内容；播种幂等，清空后重进会重新播种。
 - **时间码规则**：格式 `HH:MM:SS:FF`，帧率 25 帧；`utils/timecode.ts` 提供互转、时长汇总、重叠检测与 Take 号自动递增。
 - **无后端**：没有 API 服务、没有数据库容器；容器本身无状态，不挂载任何卷。
